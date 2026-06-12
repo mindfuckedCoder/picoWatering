@@ -1,131 +1,197 @@
 from machine import Pin
 import time
+import os
+import urequests
+import socket
 
 # ==========================================
 # CONFIGURATION & SETUP
 # ==========================================
 
 # 1. Intervals (in milliseconds for the Pico)
-MEASUREMENT_INTERVAL = 30 * 1000   # Check sensors every 30 seconds
-TODO_WAIT_TIME = 10 * 1000         # ToDo must be 10 seconds old before triggering
-VALVE_OPEN_DURATION = 5 * 1000     # Valves stay open for 5 seconds
+MEASUREMENT_INTERVAL = 1 * 60 * 1000     # Check sensors every x seconds
+TODO_WAIT_TIME = 15 * 60 *  1000          # ToDo triggers immediately (0s) for testing
+VALVE_OPEN_DURATION = 90  * 1000     # Valves stay open for 5 seconds
+CONSTANT_WATER_ALARM = 8 * 60 * 60 * 1000  # 8 hours in milliseconds (Test tip: set to 20 * 1000 for 20s test!)
+#CONSTANT_WATER_ALARM = 8 * 3600 * 1000  # 8 hours in milliseconds (Test tip: set to 20 * 1000 for 20s test!)
+# Trage hier die IP-Adresse deines PCs ein!
+PC_SERVER_URL = "http://192.168.178.81:5100/log"
+TARGET_IP = "192.168.178.81"
+TARGET_PORT = 5005
+LOG_FILE = "app_log.txt"
 
-# 2. Sensor Array (Currently only one sensor on GP16)
-# Assumption: Sensor returns 0 for dry (no water) and 1 for wet (full)
+# 2. Sensor Array
 sensors = [
     Pin(16, Pin.IN, Pin.PULL_DOWN)
 ]
 
 # 3. Mapping: Which sensor controls which relay pin?
-# Format: { Sensor_Pin_Object: Relay_Pin_Number }
 sensor_to_relay = {
-    sensors[0]: 15  # Sensor on GP16 controls the relay on GP15
+    sensors[0]: 15
 }
 
 # 4. Global storage for initialized relay objects
 relay_objects = {}
 for pin_num in sensor_to_relay.values():
-    # Initial state: Safely OFF (configured as INPUT to draw 0 current)
     relay_objects[pin_num] = Pin(pin_num, Pin.IN)
 
-# 5. The ToDo dictionary for delayed valve activation
-# Structure: { Relay_Pin_Number: Timestamp_Of_Creation }
+# 5. Dictionaries for states and timestamps
 valve_todos = {}
+water_start_timestamps = {}  # Tracks when a sensor started seeing water continuously
 
-# Timestamp for the main measurement loop
 last_measurement = time.ticks_ms()
 
-print("Application started. Sensor monitoring active...")
+# ==========================================
+# LOGGING HELPER FUNCTIONS
+# ==========================================
+
+def log_event(message):
+    """Writes to file, console, and sends it to the local PC server with safety timeout."""
+    uptime_sec = time.ticks_ms() // 1000
+    log_entry = f"[{uptime_sec}s] {message}"
+    print(log_entry)
+    
+    try:
+        sock.sendto(message.encode(), (TARGET_IP, TARGET_PORT))
+    except Exception as e:
+        print("Netzwerk-Log fehlgeschlagen:", e)
+    
+    # 1. Local File-Log
+    #try:
+    #    with open(LOG_FILE, "a") as f:
+    #        f.write(log_entry + "\n")
+    #except Exception as e:
+    #    print(f"Failed to write to log file: {e}")
+        
+    # 2. Absolut sicherer Live-Funk an den PC-Server
+    #try:
+    #    # timeout=2 verhindert, dass der Pico unendlich blockiert, falls der PC zickt
+    #    response = urequests.post(PC_SERVER_URL, data=log_entry, timeout=2.0)
+    #    response.close() # Wichtig für den RAM
+    #except Exception as e:
+    #    # Falls der Server blockiert, ignorieren wir das im Hauptprogramm
+    #    print(f"Network log failed (Server offline/blocked): {e}")
+
+def get_and_clear_log():
+    """Called by your web client later to fetch logs and wipe the file."""
+    if LOG_FILE not in os.listdir():
+        return "No logs available."
+    
+    try:
+        with open(LOG_FILE, "r") as f:
+            content = f.read()
+        os.remove(LOG_FILE) # Wipes the file from flash after reading
+        return content
+    except Exception as e:
+        return f"Error managing log file: {e}"
+
+# Initial application start log
+log_event("Application started. Sensor monitoring active...")
 
 # Helper functions for clean relay switching
 def open_valve(pin_num):
-    print(f"-> Switching relay on Pin {pin_num} ON (Valve OPENS)")
+    log_event(f"Switching relay on Pin {pin_num} ON (Valve OPENS)")
     relay_objects[pin_num].init(Pin.OUT)
-    relay_objects[pin_num].value(0) # Switches the active-low relay to GND
+    relay_objects[pin_num].value(0)
 
 def close_valve(pin_num):
-    print(f"-> Switching relay on Pin {pin_num} OFF (Valve CLOSES)")
+    log_event(f"Switching relay on Pin {pin_num} OFF (Valve CLOSES)")
     relay_objects[pin_num].init(Pin.IN)
 
 # ==========================================
 # MAIN LOOP
 # ==========================================
-try:
-    while True:
-        now = time.ticks_ms()
-        
-        # --------------------------------------------------
-        # LOOP 1: Sensor Check (Every 30 seconds)
-        # --------------------------------------------------
-        if time.ticks_diff(now, last_measurement) >= MEASUREMENT_INTERVAL:
-            print("\n--- Starting Sensor Check ---")
+def run_main_loop():
+    firstRun = True
+    log_event("Entering main loop")
+    #Put the entire while True loop inside this function.
+    global last_measurement # Needed to modify the global timestamp
+    try:
+        while True:
+            now = time.ticks_ms()
             
-            for sensor in sensors:
-                status = sensor.value()
-                assigned_relay = sensor_to_relay[sensor]
-                
-                if status == 0:
-                    # SENSOR REPORTS NO WATER
-                    if assigned_relay not in valve_todos:
-                        print(f"Sensor {sensor}: No water! Creating ToDo for relay {assigned_relay}.")
-                        valve_todos[assigned_relay] = time.ticks_ms()
-                    else:
-                        print(f"Sensor {sensor}: Still no water. ToDo already exists.")
+            # --------------------------------------------------
+            # LOOP 1: Sensor Check
+            # --------------------------------------------------
+            if firstRun or time.ticks_diff(now, last_measurement) >= MEASUREMENT_INTERVAL:
+                firstRun = False
+                log_event("Checking Sensors")
+                for sensor in sensors:
+                    log_event(f"Checking Sensor {sensor}")
+                    status = sensor.value()
+                    assigned_relay = sensor_to_relay[sensor]
+                    
+                    if status == 1:
+                        # SENSOR REPORTS NO WATER
+                        water_start_timestamps.pop(sensor, None) # Clear water timer immediately
                         
-                else:
-                    # SENSOR REPORTS FULL
-                    if assigned_relay in valve_todos:
-                        print(f"Sensor {sensor}: Water detected! Deleting ToDo for relay {assigned_relay}.")
-                        del valve_todos[assigned_relay]
+                        if assigned_relay not in valve_todos:
+                            log_event(f"Sensor {sensor}: No water detected! Creating ToDo for relay {assigned_relay}.")
+                            valve_todos[assigned_relay] = time.ticks_ms()
+                            
                     else:
-                        print(f"Sensor {sensor}: Status OK (full). No action needed.")
-            
-            # Update timestamp for the next interval
-            last_measurement = now
+                        # SENSOR REPORTS FULL / WATER DETECTED
+                        if assigned_relay in valve_todos:
+                            log_event(f"Sensor {sensor}: Water detected! Deleting ToDo for relay {assigned_relay}.")
+                            del valve_todos[assigned_relay]
+                        
+                        # 8-Hour Constant Water Check
+                        if sensor not in water_start_timestamps:
+                            # First time seeing water, start tracking the time
+                            water_start_timestamps[sensor] = time.ticks_ms()
+                        else:
+                            # Sensor is continuously wet, check how long
+                            duration = time.ticks_diff(time.ticks_ms(), water_start_timestamps[sensor])
+                            if duration >= CONSTANT_WATER_ALARM:
+                                log_event(f"WARNING: Sensor {sensor} has reported constant water for over 8 hours!")
+                                # Optional: Reset timer here if you don't want it to spam every 5 seconds
+                                # water_start_timestamps[sensor] = time.ticks_ms()
+                
+                last_measurement = now
 
-        # --------------------------------------------------
-        # LOOP 2: ToDo Check & Sequence Execution
-        # --------------------------------------------------
-        if valve_todos:
-            current_time = time.ticks_ms()
-            trigger_valves = False
-            
-            # Check if ANY ToDo is older than 10 seconds
-            for relay_pin, timestamp in list(valve_todos.items()):
-                if time.ticks_diff(current_time, timestamp) >= TODO_WAIT_TIME:
-                    print(f"The ToDo for relay {relay_pin} is older than 10 seconds!")
-                    trigger_valves = True
-                    break # One expired ToDo is enough to trigger the sequence
-            
-            # If the condition is met, execute the safety sequence
-            if trigger_valves:
-                print("!!! Action triggered: Opening ALL affected valves !!!")
+            # --------------------------------------------------
+            # LOOP 2: ToDo Check & Sequence Execution
+            # --------------------------------------------------
+            if valve_todos:
+                current_time = time.ticks_ms()
+                trigger_valves = False
                 
-                # 1. Open all valves that had an active ToDo
-                opened_valves = []
-                for relay_pin in list(valve_todos.keys()):
-                    open_valve(relay_pin)
-                    opened_valves.append(relay_pin)
-                    # ToDo is handled, remove it from the dictionary
-                    del valve_todos[relay_pin]
+                for relay_pin, timestamp in list(valve_todos.items()):
+                    if time.ticks_diff(current_time, timestamp) >= TODO_WAIT_TIME:
+                        log_event(f"The ToDo for relay {relay_pin} has expired the wait time constraint.")
+                        trigger_valves = True
+                        break
                 
-                # 2. Wait for the configurable duration X (5 seconds)
-                print(f"Keeping valves open for {VALVE_OPEN_DURATION / 1000} seconds...")
-                time.sleep_ms(VALVE_OPEN_DURATION)
-                
-                # 3. Close all valves that were opened in this sequence
-                print("Closing all opened valves.")
-                for relay_pin in opened_valves:
-                    close_valve(relay_pin)
-                
-                print("Sequence finished. Resuming normal operations.\n")
-                # Reset main timestamp so we don't measure mid-cycle
-                last_measurement = time.ticks_ms()
+                if trigger_valves:
+                    log_event("!!! Safety Sequence Triggered: Opening ALL affected valves !!!")
+                    
+                    opened_valves = []
+                    for relay_pin in list(valve_todos.keys()):
+                        open_valve(relay_pin)
+                        opened_valves.append(relay_pin)
+                        del valve_todos[relay_pin]
+                    
+                    log_event(f"Holding valves open for {VALVE_OPEN_DURATION / 1000} seconds...")
+                    time.sleep_ms(VALVE_OPEN_DURATION)
+                    
+                    log_event("Closing all opened valves.")
+                    for relay_pin in opened_valves:
+                        close_valve(relay_pin)
+                    
+                    log_event("Sequence finished. Resuming normal operations.")
+                    last_measurement = time.ticks_ms()
 
-        # Small pause to prevent the CPU from running at 100% load
-        time.sleep_ms(100)
+            time.sleep_ms(100)
 
-except KeyboardInterrupt:
-    print("Program stopped by user. Safely closing all valves.")
-    for pin_num in sensor_to_relay.values():
-        close_valve(pin_num)
+    except KeyboardInterrupt:
+        log_event("Program stopped by user. Safely closing all valves.")
+        for pin_num in sensor_to_relay.values():
+            close_valve(pin_num)
+    
+        # ==========================================
+# THE IMPORT PROTECTION
+# ==========================================
+if __name__ == "__main__":
+    # This only runs if you press "Play" in Thonny or if the file is named main.py
+    run_main_loop()
+
